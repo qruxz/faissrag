@@ -1,3 +1,28 @@
+# # ---------------------
+# # Reranker (FastEmbed ONNX)
+# # ---------------------
+# class SimpleReranker:
+#     def __init__(self, model_name="cohere"):
+#         print(f"Loading FastEmbed reranker: {model_name}")
+#         self.model = Reranker(model_name=model_name)
+#         print("Reranker loaded.")
+
+#     def rerank(self, query: str, docs: List[Document], top_k: int):
+#         if not docs:
+#             return []
+
+#         texts = [d.page_content for d in docs]
+
+#         # Returns list of scores
+#         scores = self.model.rerank(query, texts)
+
+#         ranked = list(zip(docs, scores))
+#         ranked.sort(key=lambda x: x[1], reverse=True)
+
+#         return [d for d, _ in ranked[:top_k]]
+
+# reranker = SimpleReranker()
+
 import asyncio
 import os
 from typing import Dict, List
@@ -8,14 +33,15 @@ from starlette.concurrency import run_in_threadpool
 
 # FastEmbed
 from fastembed import TextEmbedding
-from langchain.embeddings import Embeddings
+from langchain_core.embeddings import Embeddings
 
 from dotenv import load_dotenv
 from groq import Groq
 
 # ---------------------
-# Configuration
+# Config
 # ---------------------
+
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
@@ -26,7 +52,7 @@ FAISS_K = 8
 FINAL_K = 3
 
 FALLBACK_MSG = "I am unable to understand your query or it is not relevant to the services we provide."
-BANNED_WORDS = {"fuck", "fucker", "sex", "vagina", "dick", "pussy", "suicide", "terrorist", "religion"}
+BANNED_WORDS = {"fuck", "fucker", "sex", "vagina", "dick", "pussy", "suicide", "terrorist", "relegion"}
 
 
 # ---------------------
@@ -44,30 +70,22 @@ class FastEmbedWrapper(Embeddings):
 
 
 # ---------------------
-# Load Vector Store
+# Load vectorstore
 # ---------------------
-print("Initializing RAG engine...")
 emb = FastEmbedWrapper(model_name=EMBED_MODEL)
-try:
-    vector_store = FAISS.load_local(
-        FAISS_DIR,
-        emb,
-        allow_dangerous_deserialization=True
-    )
-    print(f"✓ FAISS vector store loaded from {FAISS_DIR}")
-except Exception as e:
-    print(f"✗ Error loading FAISS: {e}")
-    print(f"Please run build_faiss.py first to create the index.")
-    raise
+vector_store = FAISS.load_local(
+    FAISS_DIR,
+    emb,
+    allow_dangerous_deserialization=True
+)
 
 SESSION_MEMORY: Dict[str, List[Dict]] = {}
 
 
 # ---------------------
-# Abuse Filter
+# Abuse filter
 # ---------------------
 def contains_banned(text: str) -> bool:
-    """Check if text contains banned words"""
     low = text.lower()
     return any(w in low for w in BANNED_WORDS)
 
@@ -76,83 +94,60 @@ def contains_banned(text: str) -> bool:
 # Groq LLM
 # ---------------------
 def groq_chat(messages, model="llama-3.1-8b-instant"):
-    """Call Groq API for chat completion"""
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"Error calling Groq: {e}")
-        return FALLBACK_MSG
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages
+    )
+    return response.choices[0].message.content
 
 
 # ---------------------
-# RAG Chat Pipeline
+# FINAL RAG PIPELINE (no reranker)
 # ---------------------
 async def rag_chat_startup(session_id: str, query: str):
-    """
-    Main RAG pipeline for answering user queries.
-    Uses FAISS for retrieval and Groq LLM for generation.
-    """
-    
-    # Initialize session memory if needed
+
     if session_id not in SESSION_MEMORY:
         SESSION_MEMORY[session_id] = []
 
-    # Abuse filter on user input
-    if contains_banned(query):
-        return FALLBACK_MSG
+    # 1) FAISS search only
+    results = await run_in_threadpool(
+        vector_store.similarity_search_with_score,
+        query,
+        FAISS_K
+    )
+    faiss_docs = [doc for doc, _ in results]
 
-    # 1) FAISS retrieval
-    try:
-        results = await run_in_threadpool(
-            vector_store.similarity_search_with_score,
-            query,
-            FAISS_K
-        )
-        faiss_docs = [doc for doc, _ in results]
-    except Exception as e:
-        print(f"Error during FAISS search: {e}")
-        return FALLBACK_MSG
-
-    # 2) Select top-k documents
+    # 2) Select top-k directly from FAISS (no reranker)
     faiss_docs = faiss_docs[:FINAL_K]
 
     if not faiss_docs:
         return FALLBACK_MSG
 
-    # 3) Build context from retrieved documents
+    # 3) Build context
     context = "\n\n".join([d.page_content for d in faiss_docs])
 
-    system_prompt = f"""You are a helpful assistant for Shyampari Edutech. 
-Use ONLY the information provided below to answer the user's question.
-If the answer is not in the provided information, respond with: "{FALLBACK_MSG}"
+    system_prompt = f"""
+Use ONLY the information below to answer the user.
+If the answer is not present, reply exactly:
+"{FALLBACK_MSG}"
 
 Information:
 {context}
 """
 
-    # 4) Build message history
     messages = [{"role": "system", "content": system_prompt}]
     messages += SESSION_MEMORY[session_id]
     messages.append({"role": "user", "content": query})
 
-    # 5) Call Groq LLM
-    try:
-        answer = await run_in_threadpool(groq_chat, messages)
-    except Exception as e:
-        print(f"Error during LLM call: {e}")
-        return FALLBACK_MSG
+    # 4) Call LLM
+    answer = await run_in_threadpool(groq_chat, messages)
 
-    # 6) Abuse filter on response
+    # 5) Abuse filter
     if contains_banned(answer):
         return FALLBACK_MSG
 
-    # 7) Save to session memory
+    # 6) Save session memory
     SESSION_MEMORY[session_id].append({"role": "user", "content": query})
     SESSION_MEMORY[session_id].append({"role": "assistant", "content": answer})
-
 
     return answer
