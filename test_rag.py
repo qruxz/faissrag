@@ -1,6 +1,6 @@
 import asyncio
 import numpy as np
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain.embeddings.ollama import OllamaEmbeddings
 from rag_engine import rag_chat_startup, vector_store
 
 # ---------------------
@@ -129,4 +129,5 @@ async def run_evaluation():
 # Run
 # ---------------------
 if __name__ == "__main__":
+
     asyncio.run(run_evaluation())
