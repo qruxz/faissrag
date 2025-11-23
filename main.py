@@ -46,7 +46,7 @@ def build_faiss_index():
     
     if os.path.exists(FAISS_DIR):
         print(f"✅ FAISS index already exists at {FAISS_DIR}")
-        return
+        return True
     
     try:
         # Load PDF
@@ -64,11 +64,14 @@ def build_faiss_index():
         vector_store = FAISS.from_documents(documents=chunks, embedding=emb)
         vector_store.save_local(FAISS_DIR)
         print(f"✅ FAISS index saved to {FAISS_DIR}")
+        return True
         
-    except FileNotFoundError:
-        print("⚠️  Final_Data.pdf not found. Please upload it first.")
+    except FileNotFoundError as e:
+        print(f"⚠️  Final_Data.pdf not found: {e}")
+        return False
     except Exception as e:
         print(f"❌ Error building FAISS: {e}")
+        return False
 
 
 def load_faiss_index():
@@ -168,7 +171,7 @@ Information:
 # ==================== FASTAPI APP ====================
 app = FastAPI(title="Shyampari Edutech Chatbot")
 
-# CORS
+# CORS - Allow all origins for Render deployment
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -198,27 +201,70 @@ async def startup_event():
     """Initialize on startup"""
     global vector_store
     
-    print("🚀 Starting up...")
+    print("\n" + "="*60)
+    print("🚀 Starting Shyampari Edutech Chatbot...")
+    print("="*60)
+    print(f"📁 Current directory: {os.getcwd()}")
+    print(f"📁 Files in current directory: {os.listdir('.')[:10]}")
     
-    # Build or load FAISS
-    if not os.path.exists(FAISS_DIR):
-        build_faiss_index()
+    # Check if FAISS exists
+    if os.path.exists(FAISS_DIR):
+        print(f"\n✅ FAISS directory found at {FAISS_DIR}")
+        print(f"📁 Contents: {os.listdir(FAISS_DIR)}")
+        vector_store = load_faiss_index()
+    else:
+        print(f"\n⚠️  FAISS directory not found at {FAISS_DIR}")
+        
+        # Try to build FAISS if PDF exists
+        if os.path.exists("Final_Data.pdf"):
+            print("📄 Found Final_Data.pdf, building FAISS index...")
+            try:
+                success = await run_in_threadpool(build_faiss_index)
+                if success:
+                    vector_store = load_faiss_index()
+                else:
+                    print("❌ Failed to build FAISS index")
+                    vector_store = None
+            except Exception as e:
+                print(f"❌ Exception while building FAISS: {e}")
+                vector_store = None
+        else:
+            print("❌ Final_Data.pdf not found in current directory!")
+            print("📝 Please commit Final_Data.pdf to your repository")
+            vector_store = None
     
-    vector_store = load_faiss_index()
+    # Check GROQ API Key
+    print("\n" + "-"*60)
+    if GROQ_API_KEY:
+        print("✅ GROQ_API_KEY configured")
+    else:
+        print("⚠️  GROQ_API_KEY not set in environment!")
     
-    if not GROQ_API_KEY:
-        print("⚠️  GROQ_API_KEY not set!")
-    
+    # Final status
+    print("-"*60)
     if vector_store is None:
-        print("⚠️  FAISS not available!")
+        print("❌ WARNING: FAISS not available!")
+        print("   Chat will not work until FAISS is ready")
+    else:
+        print("✅ FAISS vector store ready!")
     
-    print("✅ Startup complete!")
+    print("="*60)
+    print("✅ Startup complete!\n")
 
 
 @app.get("/")
 async def root():
-    """Health check"""
-    return {"status": "ok", "service": "Shyampari Edutech Chatbot"}
+    """Health check endpoint"""
+    return {
+        "status": "ok",
+        "service": "Shyampari Edutech Chatbot API",
+        "version": "1.0",
+        "endpoints": {
+            "chat": "/chat",
+            "api_chat": "/api/chat",
+            "health": "/api/health"
+        }
+    }
 
 
 @app.post("/chat")
@@ -227,9 +273,11 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     global vector_store, session_memory
     
     if vector_store is None:
+        print(f"⚠️  Chat request but FAISS not ready: {request.message[:50]}")
         return ChatResponse(answer=FALLBACK_MSG)
     
     try:
+        print(f"💬 Processing chat from session {request.session_id}")
         answer = await rag_chat(
             request.session_id,
             request.message,
@@ -238,22 +286,101 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         )
         return ChatResponse(answer=answer)
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error in chat: {e}")
+        return ChatResponse(answer=FALLBACK_MSG)
+
+
+@app.post("/api/chat")
+async def api_chat_endpoint(request: ChatRequest) -> ChatResponse:
+    """API chat endpoint (alternate)"""
+    global vector_store, session_memory
+    
+    if vector_store is None:
+        print(f"⚠️  API chat request but FAISS not ready: {request.message[:50]}")
+        return ChatResponse(answer=FALLBACK_MSG)
+    
+    try:
+        print(f"💬 Processing API chat from session {request.session_id}")
+        answer = await rag_chat(
+            request.session_id,
+            request.message,
+            vector_store,
+            session_memory
+        )
+        return ChatResponse(answer=answer)
+    except Exception as e:
+        print(f"❌ Error in API chat: {e}")
         return ChatResponse(answer=FALLBACK_MSG)
 
 
 @app.get("/api/health")
 async def health():
-    """Health endpoint"""
+    """Health check endpoint"""
     return {
         "status": "healthy",
-        "faiss": vector_store is not None,
-        "groq_key": GROQ_API_KEY is not None
+        "service": "Shyampari Edutech Chatbot",
+        "faiss_ready": vector_store is not None,
+        "groq_configured": GROQ_API_KEY is not None
     }
 
 
-# ==================== RUN ====================
+@app.get("/api/status")
+async def status():
+    """Detailed status endpoint"""
+    return {
+        "service": "Shyampari Edutech Chatbot",
+        "version": "1.0",
+        "faiss": {
+            "status": "ready" if vector_store is not None else "not_ready",
+            "path": FAISS_DIR,
+            "exists": os.path.exists(FAISS_DIR)
+        },
+        "groq": {
+            "status": "configured" if GROQ_API_KEY else "not_configured"
+        },
+        "sessions": len(session_memory)
+    }
+
+
+@app.post("/api/rebuild")
+async def rebuild_endpoint():
+    """Rebuild FAISS index endpoint"""
+    global vector_store
+    
+    print("🔨 Rebuild request received...")
+    
+    if os.path.exists(FAISS_DIR):
+        print("Removing existing FAISS index...")
+        import shutil
+        shutil.rmtree(FAISS_DIR)
+    
+    try:
+        success = await run_in_threadpool(build_faiss_index)
+        if success:
+            vector_store = load_faiss_index()
+            return {"status": "success", "message": "FAISS rebuilt successfully"}
+        else:
+            return {"status": "error", "message": "Failed to build FAISS"}
+    except Exception as e:
+        print(f"❌ Rebuild error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# ==================== RENDER DEPLOYMENT ====================
+# Render expects the app to be exported as 'app'
+
 if __name__ == "__main__":
     import uvicorn
-    print("🌐 Starting server at http://0.0.0.0:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    # Get port from environment or default to 8000
+    port = int(os.getenv("PORT", 8000))
+    
+    print(f"🌐 Starting on port {port}")
+    
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        log_level="info"
+    )
