@@ -8,7 +8,7 @@ from starlette.concurrency import run_in_threadpool
 
 # FastEmbed
 from fastembed import TextEmbedding
-from langchain_core.embeddings import Embeddings
+from langchain.embeddings import Embeddings
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -153,5 +153,6 @@ Information:
     # 7) Save to session memory
     SESSION_MEMORY[session_id].append({"role": "user", "content": query})
     SESSION_MEMORY[session_id].append({"role": "assistant", "content": answer})
+
 
     return answer
